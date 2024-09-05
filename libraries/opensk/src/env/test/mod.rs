@@ -13,19 +13,20 @@
 // limitations under the License.
 
 use crate::api::clock::Clock;
-use crate::api::connection::{HidConnection, SendOrRecvResult, SendOrRecvStatus};
+use crate::api::connection::{HidConnection, RecvStatus, UsbEndpoint};
 use crate::api::crypto::software_crypto::SoftwareCrypto;
 use crate::api::customization::DEFAULT_CUSTOMIZATION;
 use crate::api::key_store;
 use crate::api::persist::{Persist, PersistIter};
 use crate::api::rng::Rng;
-use crate::api::user_presence::{UserPresence, UserPresenceResult};
+use crate::api::user_presence::{UserPresence, UserPresenceResult, UserPresenceWaitResult};
 use crate::ctap::status_code::CtapResult;
 use crate::env::Env;
 use customization::TestCustomization;
 use persistent_store::{BufferOptions, BufferStorage, Store};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use std::sync::{Arc, Mutex};
 
 pub mod customization;
 
@@ -47,15 +48,20 @@ pub struct TestTimer {
     end_ms: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TestClock {
     /// The current time, as advanced, in milliseconds.
-    now_ms: usize,
+    now_ms: Arc<Mutex<usize>>,
 }
 
 impl TestClock {
-    pub fn advance(&mut self, milliseconds: usize) {
-        self.now_ms += milliseconds;
+    pub fn now(&self) -> usize {
+        *self.now_ms.lock().unwrap()
+    }
+
+    pub fn advance(&self, milliseconds: usize) {
+        let mut locked_now_ms = self.now_ms.lock().unwrap();
+        *locked_now_ms += milliseconds;
     }
 }
 
@@ -64,18 +70,18 @@ impl Clock for TestClock {
 
     fn make_timer(&mut self, milliseconds: usize) -> Self::Timer {
         TestTimer {
-            end_ms: self.now_ms + milliseconds,
+            end_ms: self.now() + milliseconds,
         }
     }
 
     fn is_elapsed(&mut self, timer: &Self::Timer) -> bool {
-        self.now_ms >= timer.end_ms
+        self.now() >= timer.end_ms
     }
 
     #[cfg(feature = "debug_ctap")]
     fn timestamp_us(&mut self) -> usize {
         // Unused, but let's implement something because it's easy.
-        self.now_ms * 1000
+        self.now() * 1000
     }
 }
 
@@ -128,9 +134,14 @@ impl Persist for TestEnv {
 }
 
 impl HidConnection for TestEnv {
-    fn send_and_maybe_recv(&mut self, _buf: &mut [u8; 64], _timeout_ms: usize) -> SendOrRecvResult {
-        // TODO: Implement I/O from canned requests/responses for integration testing.
-        Ok(SendOrRecvStatus::Sent)
+    // TODO: Implement I/O from canned requests/responses for integration testing.
+
+    fn send(&mut self, _buf: &[u8; 64], _endpoint: UsbEndpoint) -> CtapResult<()> {
+        Ok(())
+    }
+
+    fn recv(&mut self, _buf: &mut [u8; 64], _timeout_ms: usize) -> CtapResult<RecvStatus> {
+        Ok(RecvStatus::Received(UsbEndpoint::MainHid))
     }
 }
 
@@ -177,8 +188,12 @@ impl TestUserPresence {
 
 impl UserPresence for TestUserPresence {
     fn check_init(&mut self) {}
-    fn wait_with_timeout(&mut self, _timeout_ms: usize) -> UserPresenceResult {
-        (self.check)()
+    fn wait_with_timeout(
+        &mut self,
+        _buf: &mut [u8; 64],
+        _timeout_ms: usize,
+    ) -> UserPresenceWaitResult {
+        Ok(((self.check)(), RecvStatus::Timeout))
     }
     fn check_complete(&mut self) {}
 }
@@ -224,12 +239,7 @@ impl Env for TestEnv {
         &self.customization
     }
 
-    fn main_hid_connection(&mut self) -> &mut Self::HidConnection {
-        self
-    }
-
-    #[cfg(feature = "vendor_hid")]
-    fn vendor_hid_connection(&mut self) -> &mut Self::HidConnection {
+    fn hid_connection(&mut self) -> &mut Self {
         self
     }
 
