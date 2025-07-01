@@ -15,16 +15,24 @@
 mod keys;
 
 use crate::api::crypto::EC_FIELD_SIZE;
+#[cfg(feature = "fingerprint")]
+use crate::ctap::fingerprint::TemplateInfo;
 use crate::ctap::secret::Secret;
 use crate::ctap::status_code::{Ctap2StatusCode, CtapResult};
 use crate::ctap::PIN_AUTH_LENGTH;
+#[cfg(feature = "fingerprint")]
+use crate::ctap::{cbor_read, cbor_write};
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
+#[cfg(feature = "fingerprint")]
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp;
 use core::convert::TryFrom;
 #[cfg(test)]
 use enum_iterator::IntoEnumIterator;
+#[cfg(feature = "fingerprint")]
+use sk_cbor as cbor;
 
 pub type PersistIter<'a> = Box<dyn Iterator<Item = CtapResult<usize>> + 'a>;
 pub type PersistCredentialIter<'a> = Box<dyn Iterator<Item = CtapResult<(usize, Vec<u8>)>> + 'a>;
@@ -202,6 +210,30 @@ pub trait Persist {
     /// Resets the number of remaining PIN retries.
     fn reset_pin_retries(&mut self) -> CtapResult<()> {
         self.remove(keys::PIN_RETRIES)
+    }
+
+    /// Returns the number of failed UV attempts.
+    #[cfg(feature = "fingerprint")]
+    fn uv_fails(&self) -> CtapResult<u8> {
+        match self.find(keys::UV_RETRIES)? {
+            None => Ok(0),
+            Some(value) if value.len() == 1 => Ok(value[0]),
+            _ => Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR),
+        }
+    }
+
+    /// Decrements the number of remaining UV retries.
+    #[cfg(feature = "fingerprint")]
+    fn incr_uv_fails(&mut self) -> CtapResult<()> {
+        let old_value = self.uv_fails()?;
+        let new_value = old_value.saturating_add(1);
+        self.insert(keys::UV_RETRIES, &[new_value])
+    }
+
+    /// Resets the number of remaining UV retries.
+    #[cfg(feature = "fingerprint")]
+    fn reset_uv_retries(&mut self) -> CtapResult<()> {
+        self.remove(keys::UV_RETRIES)
     }
 
     /// Returns the minimum PIN length, if stored.
@@ -386,6 +418,116 @@ pub trait Persist {
         }
     }
 
+    /// Lists all stored template IDs.
+    #[cfg(feature = "fingerprint")]
+    fn template_infos(&self) -> CtapResult<Vec<TemplateInfo>> {
+        let mut id_list = Vec::new();
+        for key in keys::FRIENDLY_NAMES {
+            if let Some(data) = self.find(key)? {
+                let cbor_value = cbor_read(&data)
+                    .map_err(|_| Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR)?;
+                let template_info = TemplateInfo::try_from(cbor_value)?;
+                id_list.push(template_info);
+            }
+        }
+        Ok(id_list)
+    }
+
+    /// Stores a new template ID.
+    ///
+    /// We shouldn't try to create the same template ID twice, so if it already
+    /// exists, return an internal error.
+    ///
+    /// Returns `Err(CTAP2_ERR_FP_DATABASE_FULL)` if the storage is full.
+    #[cfg(feature = "fingerprint")]
+    fn store_template_id(&mut self, template_id: Vec<u8>) -> CtapResult<()> {
+        let mut new_key = None;
+        for key in keys::FRIENDLY_NAMES {
+            if let Some(data) = self.find(key)? {
+                let cbor_value = cbor_read(&data)
+                    .map_err(|_| Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR)?;
+                let template_info = TemplateInfo::try_from(cbor_value)?;
+                if template_info.template_id == template_id {
+                    return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR);
+                }
+            } else if new_key.is_none() {
+                new_key = Some(key);
+            }
+        }
+        if let Some(key) = new_key {
+            let template_info = TemplateInfo {
+                template_id,
+                template_friendly_name: None,
+            };
+            let mut data = Vec::new();
+            cbor_write(cbor::Value::from(template_info), &mut data)?;
+            self.insert(key, &data)?;
+            Ok(())
+        } else {
+            Err(Ctap2StatusCode::CTAP2_ERR_FP_DATABASE_FULL)
+        }
+    }
+
+    /// Removes the template information matching the template ID.
+    ///
+    /// Returns `Err(CTAP2_ERR_INVALID_OPTION)` if the template was not found.
+    #[cfg(feature = "fingerprint")]
+    fn remove_template_id(&mut self, template_id: &[u8]) -> CtapResult<()> {
+        for key in keys::FRIENDLY_NAMES {
+            if let Some(data) = self.find(key)? {
+                let cbor_value = cbor_read(&data)
+                    .map_err(|_| Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR)?;
+                let template_info = TemplateInfo::try_from(cbor_value)?;
+                if template_info.template_id == template_id {
+                    self.remove(key)?;
+                    return Ok(());
+                }
+            }
+        }
+        Err(Ctap2StatusCode::CTAP2_ERR_INVALID_OPTION)
+    }
+
+    /// Retrieve the BioEnrollment friendly name for a given template ID.
+    ///
+    /// Returns `Ok(None)` if the template was not found or no friendly name was set.
+    #[cfg(test)]
+    #[cfg(feature = "fingerprint")]
+    fn get_friendly_name(&self, template_id: &[u8]) -> CtapResult<Option<String>> {
+        for key in keys::FRIENDLY_NAMES {
+            if let Some(data) = self.find(key)? {
+                let cbor_value = cbor_read(&data)
+                    .map_err(|_| Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR)?;
+                let template_info = TemplateInfo::try_from(cbor_value)?;
+                if &template_info.template_id == template_id {
+                    return Ok(template_info.template_friendly_name);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Store a BioEnrollment friendly name for a given template ID.
+    ///
+    /// Returns `Err(CTAP2_ERR_INVALID_OPTION)` if the template was not found.
+    #[cfg(feature = "fingerprint")]
+    fn store_friendly_name(&mut self, template_id: &[u8], friendly_name: String) -> CtapResult<()> {
+        for key in keys::FRIENDLY_NAMES {
+            if let Some(bytes) = self.find(key)? {
+                let cbor_value = cbor_read(&bytes)
+                    .map_err(|_| Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR)?;
+                let mut template_info = TemplateInfo::try_from(cbor_value)?;
+                if template_info.template_id == template_id {
+                    template_info.template_friendly_name = Some(friendly_name);
+                    let mut data = Vec::new();
+                    cbor_write(cbor::Value::from(template_info), &mut data)?;
+                    self.insert(key, &data)?;
+                    return Ok(());
+                }
+            }
+        }
+        Err(Ctap2StatusCode::CTAP2_ERR_INVALID_OPTION)
+    }
+
     fn get_attestation(&self, id: AttestationId) -> CtapResult<Option<Attestation>> {
         let stored_id_bytes = self.find(keys::ATTESTATION_ID)?;
         if let Some(bytes) = stored_id_bytes {
@@ -568,5 +710,73 @@ mod test {
         assert_eq!(persist.reset(), Ok(()));
         assert!(persist.pin_hash().unwrap().is_none());
         assert!(persist.pin_code_point_length().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_pin_fails() {
+        let mut env = TestEnv::default();
+        let persist = env.persist();
+
+        assert_eq!(persist.pin_fails().unwrap(), 0);
+        assert_eq!(persist.incr_pin_fails(), Ok(()));
+        assert_eq!(persist.pin_fails().unwrap(), 1);
+        assert_eq!(persist.reset_pin_retries(), Ok(()));
+        assert_eq!(persist.pin_fails().unwrap(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "fingerprint")]
+    fn test_uv_fails() {
+        let mut env = TestEnv::default();
+        let persist = env.persist();
+
+        assert_eq!(persist.uv_fails().unwrap(), 0);
+        assert_eq!(persist.incr_uv_fails(), Ok(()));
+        assert_eq!(persist.uv_fails().unwrap(), 1);
+        assert_eq!(persist.reset_uv_retries(), Ok(()));
+        assert_eq!(persist.uv_fails().unwrap(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "fingerprint")]
+    fn test_fingerprint_template_id() {
+        let mut env = TestEnv::default();
+        let persist = env.persist();
+
+        assert_eq!(persist.template_infos().unwrap(), vec![]);
+        assert_eq!(persist.store_template_id(vec![0x00]), Ok(()));
+        let template_info = &persist.template_infos().unwrap()[0];
+        assert_eq!(template_info.template_id, &[0x00]);
+        assert_eq!(template_info.template_friendly_name, None);
+        assert_eq!(persist.remove_template_id(&[0x00]), Ok(()));
+        assert_eq!(persist.template_infos().unwrap(), vec![]);
+        assert_eq!(
+            persist.remove_template_id(&[0x00]),
+            Err(Ctap2StatusCode::CTAP2_ERR_INVALID_OPTION)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "fingerprint")]
+    fn test_fingerprint_friendly_name() {
+        let mut env = TestEnv::default();
+        let persist = env.persist();
+
+        assert_eq!(persist.get_friendly_name(&[0x00]).unwrap(), None);
+        assert_eq!(
+            persist.store_friendly_name(&[0x00], "Name".to_string()),
+            Err(Ctap2StatusCode::CTAP2_ERR_INVALID_OPTION)
+        );
+        assert_eq!(persist.store_template_id(vec![0x00]), Ok(()));
+        assert_eq!(
+            persist.store_friendly_name(&[0x00], "Name".to_string()),
+            Ok(())
+        );
+        assert_eq!(
+            persist.get_friendly_name(&[0x00]).unwrap(),
+            Some(String::from("Name"))
+        );
+        assert_eq!(persist.remove_template_id(&[0x00]), Ok(()));
+        assert_eq!(persist.get_friendly_name(&[0x00]).unwrap(), None);
     }
 }

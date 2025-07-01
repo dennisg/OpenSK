@@ -103,6 +103,16 @@ make_partition! {
     /// The stored large blob can be too big for one key, so it has to be sharded.
     LARGE_BLOB_SHARDS = 2000..2004;
 
+    /// Stored friendly names for enrolled fingerprints.
+    #[cfg(feature = "fingerprint")]
+    FRIENDLY_NAMES = 2031..2037;
+
+    /// Stores UV retry counter information.
+    ///
+    /// If the entry is absent, the number of UV retries is `Customization::max_uv_retries()`.
+    #[cfg(feature = "fingerprint")]
+    UV_RETRIES = 2037;
+
     /// If this entry exists and is empty, alwaysUv is enabled.
     ALWAYS_UV = 2038;
 

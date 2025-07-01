@@ -145,7 +145,7 @@ pub trait Customization {
     /// this value.
     fn max_msg_size(&self) -> usize;
 
-    /// Sets the number of consecutive failed PINs before blocking interaction.
+    /// The number of consecutive failed PINs before blocking interaction.
     ///
     /// # Invariant
     ///
@@ -154,6 +154,42 @@ pub trait Customization {
     ///
     /// The fail retry counter is reset after entering the correct PIN.
     fn max_pin_retries(&self) -> u8;
+
+    /// Maximum number of UV retries performed before returning an error.
+    ///
+    /// Corresponds to maxUvAttemptsForInternalRetries in CTAP 2.1 onwards.
+    /// When internal retries are allowed, the authenticator will retry UV
+    /// before communicating its result through CTAP.
+    ///
+    /// # Invariant
+    ///
+    /// - Must be in the range [1, `max_uv_retries`].
+    /// - If `preferred_platform_uv_attempts` is not 1, must be in [1, 5].
+    #[cfg(feature = "fingerprint")]
+    fn max_uv_attempts_for_internal_retries(&self) -> u8;
+
+    /// The number of consecutive failed UV attempts before blocking built-in UV.
+    ///
+    /// Corresponds to maxUvRetries in CTAP 2.1 onwards.
+    ///
+    /// # Invariant
+    ///
+    /// - Must be in the range [1, 25].
+    #[cfg(feature = "fingerprint")]
+    fn max_uv_retries(&self) -> u8;
+
+    /// Preferred number of UV attempts before falling back to PIN.
+    ///
+    /// Corresponds to preferredPlatformUvAttempts in CTAP 2.1 onwards.
+    /// States the preference how often the platform should invoke
+    /// `getPinUvAuthTokenUsingUvWithPermissions` before falling back to
+    /// `getPinUvAuthTokenUsingPinWithPermissions` or displaying an error.
+    ///
+    /// # Invariant
+    ///
+    /// - Must be greater than 0.
+    #[cfg(feature = "fingerprint")]
+    fn preferred_platform_uv_attempts(&self) -> usize;
 
     /// Enables or disables basic attestation for FIDO2.
     ///
@@ -252,6 +288,12 @@ pub trait Customization {
     /// With P=20 and K=150, we have I=2M which is enough for 500 increments per day
     /// for 10 years.
     fn max_supported_resident_keys(&self) -> usize;
+
+    /// Maximum size of a friendly name for a UV template.
+    ///
+    /// This value limits storage requirements for fingerprints.
+    #[cfg(feature = "fingerprint")]
+    fn max_template_friendly_name(&self) -> usize;
 }
 
 #[derive(Clone)]
@@ -266,6 +308,12 @@ pub struct CustomizationImpl {
     pub enterprise_rp_id_list: &'static [&'static str],
     pub max_msg_size: usize,
     pub max_pin_retries: u8,
+    #[cfg(feature = "fingerprint")]
+    pub max_uv_attempts_for_internal_retries: u8,
+    #[cfg(feature = "fingerprint")]
+    pub max_uv_retries: u8,
+    #[cfg(feature = "fingerprint")]
+    pub preferred_platform_uv_attempts: usize,
     pub use_batch_attestation: bool,
     pub use_signature_counter: bool,
     pub max_cred_blob_length: usize,
@@ -273,6 +321,8 @@ pub struct CustomizationImpl {
     pub max_large_blob_array_size: usize,
     pub max_rp_ids_length: usize,
     pub max_supported_resident_keys: usize,
+    #[cfg(feature = "fingerprint")]
+    pub max_template_friendly_name: usize,
 }
 
 pub const DEFAULT_CUSTOMIZATION: CustomizationImpl = CustomizationImpl {
@@ -286,6 +336,12 @@ pub const DEFAULT_CUSTOMIZATION: CustomizationImpl = CustomizationImpl {
     enterprise_rp_id_list: &[],
     max_msg_size: 7609,
     max_pin_retries: 8,
+    #[cfg(feature = "fingerprint")]
+    max_uv_attempts_for_internal_retries: 1,
+    #[cfg(feature = "fingerprint")]
+    max_uv_retries: 8,
+    #[cfg(feature = "fingerprint")]
+    preferred_platform_uv_attempts: 1,
     use_batch_attestation: false,
     use_signature_counter: true,
     max_cred_blob_length: 32,
@@ -293,6 +349,8 @@ pub const DEFAULT_CUSTOMIZATION: CustomizationImpl = CustomizationImpl {
     max_large_blob_array_size: 2048,
     max_rp_ids_length: 8,
     max_supported_resident_keys: 150,
+    #[cfg(feature = "fingerprint")]
+    max_template_friendly_name: 64,
 };
 
 impl Customization for CustomizationImpl {
@@ -347,6 +405,21 @@ impl Customization for CustomizationImpl {
         self.max_pin_retries
     }
 
+    #[cfg(feature = "fingerprint")]
+    fn max_uv_attempts_for_internal_retries(&self) -> u8 {
+        self.max_uv_attempts_for_internal_retries
+    }
+
+    #[cfg(feature = "fingerprint")]
+    fn max_uv_retries(&self) -> u8 {
+        self.max_uv_retries
+    }
+
+    #[cfg(feature = "fingerprint")]
+    fn preferred_platform_uv_attempts(&self) -> usize {
+        self.preferred_platform_uv_attempts
+    }
+
     fn use_batch_attestation(&self) -> bool {
         self.use_batch_attestation
     }
@@ -373,6 +446,11 @@ impl Customization for CustomizationImpl {
 
     fn max_supported_resident_keys(&self) -> usize {
         self.max_supported_resident_keys
+    }
+
+    #[cfg(feature = "fingerprint")]
+    fn max_template_friendly_name(&self) -> usize {
+        self.max_template_friendly_name
     }
 }
 
@@ -446,6 +524,32 @@ pub fn is_valid(customization: &impl Customization) -> bool {
         return false;
     }
 
+    #[cfg(feature = "fingerprint")]
+    {
+        // Maximum UV retries must be in range [1, 25].
+        if customization.max_uv_retries() < 1 || customization.max_uv_retries() > 25 {
+            return false;
+        }
+
+        // Maximum internal UV attemps must be in range [1, `max_uv_retries`].
+        // If preferred platform UV attemps is not 1, must additionally be in [1, 5].
+        if customization.max_uv_attempts_for_internal_retries() < 1
+            || customization.max_uv_attempts_for_internal_retries() > customization.max_uv_retries()
+        {
+            return false;
+        }
+        if customization.preferred_platform_uv_attempts() != 1
+            && customization.max_uv_attempts_for_internal_retries() > 5
+        {
+            return false;
+        }
+
+        // Preferred number of UV attempts must be positive.
+        if customization.preferred_platform_uv_attempts() == 0 {
+            return false;
+        }
+    }
+
     true
 }
 
@@ -471,6 +575,12 @@ mod test {
             enterprise_rp_id_list: &[],
             max_msg_size: 7609,
             max_pin_retries: 8,
+            #[cfg(feature = "fingerprint")]
+            max_uv_attempts_for_internal_retries: 1,
+            #[cfg(feature = "fingerprint")]
+            max_uv_retries: 8,
+            #[cfg(feature = "fingerprint")]
+            preferred_platform_uv_attempts: 1,
             use_batch_attestation: true,
             use_signature_counter: true,
             max_cred_blob_length: 32,
@@ -478,6 +588,8 @@ mod test {
             max_large_blob_array_size: 2048,
             max_rp_ids_length: 8,
             max_supported_resident_keys: 150,
+            #[cfg(feature = "fingerprint")]
+            max_template_friendly_name: 64,
         };
         assert_eq!(customization.aaguid(), &[0; AAGUID_LENGTH]);
         assert!(customization.allows_pin_protocol_v1());
@@ -492,6 +604,12 @@ mod test {
         assert!(customization.enterprise_rp_id_list().is_empty());
         assert_eq!(customization.max_msg_size(), 7609);
         assert_eq!(customization.max_pin_retries(), 8);
+        #[cfg(feature = "fingerprint")]
+        assert_eq!(customization.max_uv_attempts_for_internal_retries(), 1);
+        #[cfg(feature = "fingerprint")]
+        assert_eq!(customization.max_uv_retries(), 8);
+        #[cfg(feature = "fingerprint")]
+        assert_eq!(customization.preferred_platform_uv_attempts(), 1);
         assert!(customization.use_batch_attestation());
         assert!(customization.use_signature_counter());
         assert_eq!(customization.max_cred_blob_length(), 32);
@@ -499,5 +617,7 @@ mod test {
         assert_eq!(customization.max_large_blob_array_size(), 2048);
         assert_eq!(customization.max_rp_ids_length(), 8);
         assert_eq!(customization.max_supported_resident_keys(), 150);
+        #[cfg(feature = "fingerprint")]
+        assert_eq!(customization.max_template_friendly_name(), 64);
     }
 }

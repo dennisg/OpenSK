@@ -22,6 +22,8 @@ pub mod crypto_wrapper;
 #[cfg(feature = "with_ctap1")]
 mod ctap1;
 pub mod data_formats;
+#[cfg(feature = "fingerprint")]
+pub mod fingerprint;
 pub mod hid;
 mod large_blobs;
 pub mod main_hid;
@@ -50,6 +52,8 @@ use self::data_formats::{
     PublicKeyCredentialDescriptor, PublicKeyCredentialParameter, PublicKeyCredentialSource,
     PublicKeyCredentialType, PublicKeyCredentialUserEntity, SignatureAlgorithm,
 };
+#[cfg(feature = "fingerprint")]
+use self::fingerprint::{perform_built_in_uv, process_bio_enrollment};
 use self::hid::{
     ChannelID, CtapHid, CtapHidCommand, HidPacketIterator, KeepaliveStatus, ProcessedPacket,
 };
@@ -69,6 +73,8 @@ use crate::api::crypto::hkdf256::Hkdf256;
 use crate::api::crypto::sha256::Sha256;
 use crate::api::crypto::HASH_SIZE;
 use crate::api::customization::Customization;
+#[cfg(feature = "fingerprint")]
+use crate::api::fingerprint::Fingerprint;
 use crate::api::key_store::{CredentialSource, KeyStore, MAX_CREDENTIAL_ID_SIZE};
 use crate::api::persist::{Attestation, AttestationId, Persist};
 use crate::api::private_key::PrivateKey;
@@ -258,7 +264,7 @@ fn truncate_to_char_boundary(s: &str, mut max: usize) -> &str {
 }
 
 /// Send non-critical packets using fire-and-forget.
-fn send_packets<E: Env>(
+pub fn send_packets<E: Env>(
     env: &mut E,
     endpoint: UsbEndpoint,
     packets: HidPacketIterator,
@@ -686,8 +692,14 @@ impl<E: Env> CtapState<E> {
             }
             Command::AuthenticatorGetNextAssertion => self.process_get_next_assertion(env),
             Command::AuthenticatorGetInfo => self.process_get_info(env),
-            Command::AuthenticatorClientPin(params) => self.client_pin.process_command(env, params),
+            Command::AuthenticatorClientPin(params) => {
+                self.client_pin.process_command(env, params, channel)
+            }
             Command::AuthenticatorReset => self.process_reset(env, channel),
+            #[cfg(feature = "fingerprint")]
+            Command::AuthenticatorBioEnrollment(params) => {
+                process_bio_enrollment(env, &mut self.client_pin, params)
+            }
             Command::AuthenticatorCredentialManagement(params) => process_credential_management(
                 env,
                 &mut self.stateful_command_permission,
@@ -816,16 +828,26 @@ impl<E: Env> CtapState<E> {
             }
             None => {
                 if options.uv {
+                    #[cfg(not(feature = "fingerprint"))]
                     return Err(Ctap2StatusCode::CTAP2_ERR_INVALID_OPTION);
+                    // The specification says:
+                    // If the uvRetries counter is 0, return CTAP2_ERR_PIN_BLOCKED.
+                    // But I assume this is a typo and should be UV_BLOCKED instead.
+                    // https://github.com/fido-alliance/fido-2-specs/issues/1672
+                    #[cfg(feature = "fingerprint")]
+                    perform_built_in_uv(env, channel, true)?;
+                    #[cfg(feature = "fingerprint")]
+                    UV_FLAG
+                } else {
+                    if storage::has_always_uv(env)? {
+                        return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
+                    }
+                    // Corresponds to makeCredUvNotRqd set to true.
+                    if options.rk && env.persist().pin_hash()?.is_some() {
+                        return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
+                    }
+                    0x00
                 }
-                if storage::has_always_uv(env)? {
-                    return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
-                }
-                // Corresponds to makeCredUvNotRqd set to true.
-                if options.rk && env.persist().pin_hash()?.is_some() {
-                    return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
-                }
-                0x00
             }
         };
         flags |= UP_FLAG | AT_FLAG;
@@ -1186,14 +1208,23 @@ impl<E: Env> CtapState<E> {
             }
             None => {
                 if options.uv {
+                    #[cfg(not(feature = "fingerprint"))]
                     return Err(Ctap2StatusCode::CTAP2_ERR_INVALID_OPTION);
+                    // Same error code ambiguity as in MakeCredential.
+                    // https://github.com/fido-alliance/fido-2-specs/issues/1672
+                    #[cfg(feature = "fingerprint")]
+                    perform_built_in_uv(env, channel, true)?;
+                    #[cfg(feature = "fingerprint")]
+                    UV_FLAG
+                } else {
+                    if options.up && storage::has_always_uv(env)? {
+                        return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
+                    }
+                    0x00
                 }
-                if options.up && storage::has_always_uv(env)? {
-                    return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
-                }
-                0x00
             }
         };
+
         if options.up {
             flags |= UP_FLAG;
         }
@@ -1294,28 +1325,33 @@ impl<E: Env> CtapState<E> {
         if !has_always_uv {
             versions.insert(0, String::from(U2F_VERSION_STRING))
         }
-        let mut options = vec![];
-        if env.customization().enterprise_attestation_mode().is_some() {
-            options.push((String::from("ep"), storage::enterprise_attestation(env)?));
-        }
-        options.append(&mut vec![
+        let mut options = vec![
             (String::from("rk"), true),
-            (String::from("up"), true),
-            (String::from("credMgmt"), true),
-            #[cfg(feature = "config_command")]
-            (String::from("authnrCfg"), true),
             (
                 String::from("clientPin"),
                 env.persist().pin_hash()?.is_some(),
             ),
-            (String::from("largeBlobs"), true),
+            (String::from("up"), true),
             (String::from("pinUvAuthToken"), true),
+            (String::from("largeBlobs"), true),
+            #[cfg(feature = "config_command")]
+            (String::from("authnrCfg"), true),
+            #[cfg(feature = "config_command")]
+            (String::from("uvAcfg"), true),
+            (String::from("credMgmt"), true),
             #[cfg(feature = "config_command")]
             (String::from("setMinPINLength"), true),
             (String::from("makeCredUvNotRqd"), !has_always_uv),
-        ]);
-        if cfg!(feature = "config_command") || env.customization().enforce_always_uv() {
-            options.push((String::from("alwaysUv"), has_always_uv));
+            (String::from("alwaysUv"), has_always_uv),
+        ];
+        #[cfg(feature = "fingerprint")]
+        {
+            let has_fingerprint = !env.persist().template_infos()?.is_empty();
+            options.push((String::from("uv"), has_fingerprint));
+            options.push((String::from("bioEnroll"), has_fingerprint));
+        }
+        if env.customization().enterprise_attestation_mode().is_some() {
+            options.push((String::from("ep"), storage::enterprise_attestation(env)?));
         }
         let mut pin_protocols = vec![PinUvAuthProtocol::V2 as u64];
         if env.customization().allows_pin_protocol_v1() {
@@ -1354,6 +1390,17 @@ impl<E: Env> CtapState<E> {
                 max_rp_ids_for_set_min_pin_length: Some(
                     env.customization().max_rp_ids_length() as u64
                 ),
+                #[cfg(feature = "fingerprint")]
+                preferred_platform_uv_attempts: Some(
+                    env.customization().preferred_platform_uv_attempts() as u64,
+                ),
+                #[cfg(not(feature = "fingerprint"))]
+                preferred_platform_uv_attempts: None,
+                // https://fidoalliance.org/specs/common-specs/fido-registry-v2.2-ps-20220523.html#user-verification-methods
+                #[cfg(feature = "fingerprint")]
+                uv_modality: Some(0x02),
+                #[cfg(not(feature = "fingerprint"))]
+                uv_modality: None,
                 certifications: None,
                 remaining_discoverable_credentials: Some(
                     storage::remaining_credentials(env)? as u64
@@ -1373,6 +1420,18 @@ impl<E: Env> CtapState<E> {
 
         reset(env)?;
         self.client_pin.reset(env);
+
+        #[cfg(feature = "fingerprint")]
+        {
+            let template_infos = env.persist().template_infos()?;
+            for template_info in template_infos {
+                env.fingerprint()
+                    .remove_enrollment(&template_info.template_id)?;
+                env.persist()
+                    .remove_template_id(&template_info.template_id)?;
+            }
+        }
+
         #[cfg(feature = "with_ctap1")]
         {
             // We create a block statement to wrap this assignment expression, because attributes
@@ -1493,6 +1552,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "fingerprint")]
     fn test_get_info() {
         let mut env = TestEnv::default();
         let mut ctap_state = CtapState::<TestEnv>::new(&mut env);
@@ -1519,6 +1579,74 @@ mod test {
                 "ep" => env.customization().enterprise_attestation_mode().map(|_| false),
                 "rk" => true,
                 "up" => true,
+                "uv" => false,
+                #[cfg(feature = "config_command")]
+                "uvAcfg" => true,
+                #[cfg(feature = "config_command")]
+                "alwaysUv" => false,
+                "credMgmt" => true,
+                #[cfg(feature = "config_command")]
+                "authnrCfg" => true,
+                "bioEnroll" => false,
+                "clientPin" => false,
+                "largeBlobs" => true,
+                "pinUvAuthToken" => true,
+                #[cfg(feature = "config_command")]
+                "setMinPINLength" => true,
+                "makeCredUvNotRqd" => true,
+            },
+            0x05 => env.customization().max_msg_size() as u64,
+            0x06 => cbor_array![2, 1],
+            0x07 => env.customization().max_credential_count_in_list().map(|c| c as u64),
+            0x08 => MAX_CREDENTIAL_ID_SIZE as u64,
+            0x09 => cbor_array!["usb"],
+            0x0A => cbor_array_vec!(SUPPORTED_CRED_PARAMS.to_vec()),
+            0x0B => env.customization().max_large_blob_array_size() as u64,
+            0x0C => false,
+            0x0D => storage::min_pin_length(&mut env).unwrap() as u64,
+            0x0E => 0,
+            0x0F => env.customization().max_cred_blob_length() as u64,
+            0x10 => env.customization().max_rp_ids_length() as u64,
+            0x11 => env.customization().preferred_platform_uv_attempts() as u64,
+            0x12 => 0x02,
+            0x14 => storage::remaining_credentials(&mut env).unwrap() as u64,
+        };
+
+        let mut response_cbor = vec![0x00];
+        assert!(cbor_write(expected_cbor, &mut response_cbor).is_ok());
+        assert_eq!(info_reponse, response_cbor);
+    }
+
+    #[test]
+    #[cfg(not(feature = "fingerprint"))]
+    fn test_get_info() {
+        let mut env = TestEnv::default();
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env);
+        let info_reponse = ctap_state.process_command(&mut env, &[0x04], DUMMY_CHANNEL);
+
+        // Fails when removing `to_vec` for `SUPPORTED_CRED_PARAMS` as linted.
+        #[allow(clippy::unnecessary_to_owned)]
+        let expected_cbor = cbor_map_options! {
+             0x01 => cbor_array_vec![vec![
+                    #[cfg(feature = "with_ctap1")]
+                    String::from(U2F_VERSION_STRING),
+                    String::from(FIDO2_VERSION_STRING),
+                    String::from(FIDO2_1_VERSION_STRING),
+                ]],
+            0x02 => cbor_array![
+                    String::from("hmac-secret"),
+                    String::from("credProtect"),
+                    String::from("minPinLength"),
+                    String::from("credBlob"),
+                    String::from("largeBlobKey"),
+                ],
+            0x03 => env.customization().aaguid(),
+            0x04 => cbor_map_options! {
+                "ep" => env.customization().enterprise_attestation_mode().map(|_| false),
+                "rk" => true,
+                "up" => true,
+                #[cfg(feature = "config_command")]
+                "uvAcfg" => true,
                 #[cfg(feature = "config_command")]
                 "alwaysUv" => false,
                 "credMgmt" => true,
@@ -2447,9 +2575,10 @@ mod test {
             permissions: None,
             permissions_rp_id: None,
         };
-        let key_agreement_response = ctap_state
-            .client_pin
-            .process_command(&mut env, client_pin_params);
+        let key_agreement_response =
+            ctap_state
+                .client_pin
+                .process_command(&mut env, client_pin_params, DUMMY_CHANNEL);
         let get_assertion_params = get_assertion_hmac_secret_params(
             key_agreement_key,
             key_agreement_response.unwrap(),
@@ -2498,9 +2627,10 @@ mod test {
             permissions: None,
             permissions_rp_id: None,
         };
-        let key_agreement_response = ctap_state
-            .client_pin
-            .process_command(&mut env, client_pin_params);
+        let key_agreement_response =
+            ctap_state
+                .client_pin
+                .process_command(&mut env, client_pin_params, DUMMY_CHANNEL);
         let get_assertion_params = get_assertion_hmac_secret_params(
             key_agreement_key,
             key_agreement_response.unwrap(),

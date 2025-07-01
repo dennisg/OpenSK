@@ -203,6 +203,27 @@ pub fn reset_pin_retries(env: &mut impl Env) -> CtapResult<()> {
     env.persist().reset_pin_retries()
 }
 
+/// Returns the number of remaining UV retries.
+#[cfg(feature = "fingerprint")]
+pub fn uv_retries(env: &mut impl Env) -> CtapResult<u8> {
+    Ok(env
+        .customization()
+        .max_uv_retries()
+        .saturating_sub(env.persist().uv_fails()?))
+}
+
+/// Decrements the number of remaining UV retries.
+#[cfg(feature = "fingerprint")]
+pub fn decr_uv_retries(env: &mut impl Env) -> CtapResult<()> {
+    env.persist().incr_uv_fails()
+}
+
+/// Resets the number of remaining UV retries.
+#[cfg(feature = "fingerprint")]
+pub fn reset_uv_retries(env: &mut impl Env) -> CtapResult<()> {
+    env.persist().reset_uv_retries()
+}
+
 /// Returns the minimum PIN length.
 pub fn min_pin_length(env: &mut impl Env) -> CtapResult<u8> {
     Ok(env
@@ -638,6 +659,35 @@ mod test {
         assert_eq!(
             pin_retries(&mut env),
             Ok(env.customization().max_pin_retries())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "fingerprint")]
+    fn test_uv_retries() {
+        let mut env = TestEnv::default();
+
+        // The uv retries is initially at the maximum.
+        assert_eq!(
+            uv_retries(&mut env),
+            Ok(env.customization().max_uv_retries())
+        );
+
+        // Decrementing the uv retries decrements the uv retries.
+        for retries in (0..env.customization().max_uv_retries()).rev() {
+            decr_uv_retries(&mut env).unwrap();
+            assert_eq!(uv_retries(&mut env), Ok(retries));
+        }
+
+        // Decrementing the uv retries after zero does not modify the uv retries.
+        decr_uv_retries(&mut env).unwrap();
+        assert_eq!(uv_retries(&mut env), Ok(0));
+
+        // Resetting the uv retries resets the uv retries.
+        reset_uv_retries(&mut env).unwrap();
+        assert_eq!(
+            uv_retries(&mut env),
+            Ok(env.customization().max_uv_retries())
         );
     }
 

@@ -17,6 +17,10 @@ use super::data_formats::{
     PublicKeyCredentialDescriptor, PublicKeyCredentialParameter, PublicKeyCredentialRpEntity,
     PublicKeyCredentialUserEntity,
 };
+#[cfg(feature = "fingerprint")]
+use super::fingerprint::TemplateInfo;
+#[cfg(feature = "fingerprint")]
+use crate::api::fingerprint::Ctap2EnrollFeedback;
 use alloc::string::String;
 use alloc::vec::Vec;
 use sk_cbor as cbor;
@@ -33,6 +37,8 @@ pub enum ResponseData {
     AuthenticatorGetInfo(AuthenticatorGetInfoResponse),
     AuthenticatorClientPin(Option<AuthenticatorClientPinResponse>),
     AuthenticatorReset,
+    #[cfg(feature = "fingerprint")]
+    AuthenticatorBioEnrollment(Option<AuthenticatorBioEnrollmentResponse>),
     AuthenticatorCredentialManagement(Option<AuthenticatorCredentialManagementResponse>),
     AuthenticatorSelection,
     AuthenticatorLargeBlobs(Option<AuthenticatorLargeBlobsResponse>),
@@ -49,6 +55,8 @@ impl From<ResponseData> for Option<cbor::Value> {
             ResponseData::AuthenticatorGetInfo(data) => Some(data.into()),
             ResponseData::AuthenticatorClientPin(data) => data.map(|d| d.into()),
             ResponseData::AuthenticatorReset => None,
+            #[cfg(feature = "fingerprint")]
+            ResponseData::AuthenticatorBioEnrollment(data) => data.map(|d| d.into()),
             ResponseData::AuthenticatorCredentialManagement(data) => data.map(|d| d.into()),
             ResponseData::AuthenticatorSelection => None,
             ResponseData::AuthenticatorLargeBlobs(data) => data.map(|d| d.into()),
@@ -138,11 +146,8 @@ pub struct AuthenticatorGetInfoResponse {
     pub firmware_version: Option<u64>,
     pub max_cred_blob_length: Option<u64>,
     pub max_rp_ids_for_set_min_pin_length: Option<u64>,
-    // Missing response fields as they are only relevant for internal UV:
-    // - 0x11: preferredPlatformUvAttempts
-    // - 0x12: uvModality
-    // Add them when your hardware supports any kind of user verification within
-    // the boundary of the device, e.g. fingerprint or built-in keyboard.
+    pub preferred_platform_uv_attempts: Option<u64>,
+    pub uv_modality: Option<u64>,
     pub certifications: Option<Vec<(String, i64)>>,
     pub remaining_discoverable_credentials: Option<u64>,
     // - 0x15: vendorPrototypeConfigCommands missing as we don't support it.
@@ -167,6 +172,8 @@ impl From<AuthenticatorGetInfoResponse> for cbor::Value {
             firmware_version,
             max_cred_blob_length,
             max_rp_ids_for_set_min_pin_length,
+            preferred_platform_uv_attempts,
+            uv_modality,
             certifications,
             remaining_discoverable_credentials,
         } = get_info_response;
@@ -204,6 +211,8 @@ impl From<AuthenticatorGetInfoResponse> for cbor::Value {
             0x0E => firmware_version,
             0x0F => max_cred_blob_length,
             0x10 => max_rp_ids_for_set_min_pin_length,
+            0x11 => preferred_platform_uv_attempts,
+            0x12 => uv_modality,
             0x13 => certifications_cbor,
             0x14 => remaining_discoverable_credentials,
         }
@@ -216,7 +225,7 @@ pub struct AuthenticatorClientPinResponse {
     pub pin_uv_auth_token: Option<Vec<u8>>,
     pub retries: Option<u64>,
     pub power_cycle_state: Option<bool>,
-    // - 0x05: uvRetries missing as we don't support internal UV.
+    pub uv_retries: Option<u64>,
 }
 
 impl From<AuthenticatorClientPinResponse> for cbor::Value {
@@ -226,6 +235,7 @@ impl From<AuthenticatorClientPinResponse> for cbor::Value {
             pin_uv_auth_token,
             retries,
             power_cycle_state,
+            uv_retries,
         } = client_pin_response;
 
         cbor_map_options! {
@@ -233,6 +243,46 @@ impl From<AuthenticatorClientPinResponse> for cbor::Value {
             0x02 => pin_uv_auth_token,
             0x03 => retries,
             0x04 => power_cycle_state,
+            0x05 => uv_retries,
+        }
+    }
+}
+
+#[cfg(feature = "fingerprint")]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AuthenticatorBioEnrollmentResponse {
+    pub modality: Option<u64>,
+    pub fingerprint_kind: Option<u64>,
+    pub max_capture_samples_required_for_enroll: Option<u64>,
+    pub template_id: Option<Vec<u8>>,
+    pub last_enroll_sample_status: Option<Ctap2EnrollFeedback>,
+    pub remaining_samples: Option<u64>,
+    pub template_infos: Option<Vec<TemplateInfo>>,
+    pub max_template_friendly_name: Option<u64>,
+}
+
+#[cfg(feature = "fingerprint")]
+impl From<AuthenticatorBioEnrollmentResponse> for cbor::Value {
+    fn from(bio_enrollment_response: AuthenticatorBioEnrollmentResponse) -> Self {
+        let AuthenticatorBioEnrollmentResponse {
+            modality,
+            fingerprint_kind,
+            max_capture_samples_required_for_enroll,
+            template_id,
+            last_enroll_sample_status,
+            remaining_samples,
+            template_infos,
+            max_template_friendly_name,
+        } = bio_enrollment_response;
+        cbor_map_options! {
+            0x01 => modality,
+            0x02 => fingerprint_kind,
+            0x03 => max_capture_samples_required_for_enroll,
+            0x04 => template_id,
+            0x05 => last_enroll_sample_status,
+            0x06 => remaining_samples,
+            0x07 => template_infos.map(|vec| cbor_array_vec!(vec)),
+            0x08 => max_template_friendly_name,
         }
     }
 }
@@ -404,6 +454,8 @@ mod test {
             firmware_version: None,
             max_cred_blob_length: None,
             max_rp_ids_for_set_min_pin_length: None,
+            preferred_platform_uv_attempts: None,
+            uv_modality: None,
             certifications: None,
             remaining_discoverable_credentials: None,
         };
@@ -436,6 +488,8 @@ mod test {
             firmware_version: Some(0),
             max_cred_blob_length: Some(1024),
             max_rp_ids_for_set_min_pin_length: Some(8),
+            preferred_platform_uv_attempts: Some(1),
+            uv_modality: Some(1),
             certifications: Some(vec![(String::from("example-cert"), 1)]),
             remaining_discoverable_credentials: Some(150),
         };
@@ -458,6 +512,8 @@ mod test {
             0x0E => 0,
             0x0F => 1024,
             0x10 => 8,
+            0x11 => 1,
+            0x12 => 1,
             0x13 => cbor_map! {"example-cert" => 1},
             0x14 => 150,
         };
@@ -472,6 +528,7 @@ mod test {
             pin_uv_auth_token: Some(vec![70]),
             retries: Some(8),
             power_cycle_state: Some(false),
+            uv_retries: Some(0),
         };
         let response_cbor: Option<cbor::Value> =
             ResponseData::AuthenticatorClientPin(Some(client_pin_response)).into();
@@ -480,6 +537,7 @@ mod test {
             0x02 => vec![70],
             0x03 => 8,
             0x04 => false,
+            0x05 => 0,
         };
         assert_eq!(response_cbor, Some(expected_cbor));
     }
@@ -493,6 +551,49 @@ mod test {
     #[test]
     fn test_reset_into_cbor() {
         let response_cbor: Option<cbor::Value> = ResponseData::AuthenticatorReset.into();
+        assert_eq!(response_cbor, None);
+    }
+
+    #[test]
+    #[cfg(feature = "fingerprint")]
+    fn test_used_bio_enrollment_into_cbor() {
+        let template_info = TemplateInfo {
+            template_id: vec![1],
+            template_friendly_name: Some(String::from("Name")),
+        };
+        let bio_enrollment_response = AuthenticatorBioEnrollmentResponse {
+            modality: Some(1),
+            fingerprint_kind: Some(2),
+            max_capture_samples_required_for_enroll: Some(3),
+            template_id: Some(vec![4]),
+            last_enroll_sample_status: Some(Ctap2EnrollFeedback::FpTooFast),
+            remaining_samples: Some(6),
+            template_infos: Some(vec![template_info]),
+            max_template_friendly_name: Some(8),
+        };
+        let response_cbor: Option<cbor::Value> =
+            ResponseData::AuthenticatorBioEnrollment(Some(bio_enrollment_response)).into();
+        let expected_cbor = cbor_map_options! {
+            0x01 => 1,
+            0x02 => 2,
+            0x03 => 3,
+            0x04 => vec![4],
+            0x05 => 5,
+            0x06 => 6,
+            0x07 => cbor_array![cbor_map! {
+                0x01 => vec![1],
+                0x02 => "Name",
+            }],
+            0x08 => 8,
+        };
+        assert_eq!(response_cbor, Some(expected_cbor));
+    }
+
+    #[test]
+    #[cfg(feature = "fingerprint")]
+    fn test_empty_bio_enrollment_into_cbor() {
+        let response_cbor: Option<cbor::Value> =
+            ResponseData::AuthenticatorBioEnrollment(None).into();
         assert_eq!(response_cbor, None);
     }
 
